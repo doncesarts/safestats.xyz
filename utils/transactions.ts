@@ -1,8 +1,7 @@
 import axios from 'axios'
 import pRetry from 'p-retry'
-import { Contract, providers, Transaction, utils } from 'ethers'
+import { BigNumber, Contract, providers, Transaction, utils } from 'ethers'
 import GnosisSafe from 'utils/abis/GnosisSafe.json'
-import { ChainId } from 'eth-chains'
 
 // This code was inspired by the "checkNSignatures" function in the Gnosis Safe contract
 export const recoverAddress = (dataHashStr: string, signature: string) => {
@@ -25,51 +24,158 @@ export const recoverAddress = (dataHashStr: string, signature: string) => {
   return utils.recoverAddress(dataHash, { v, r, s })
 }
 
-// TODO: Decode data from functions other than execTransaction (e.g. MultiSend)
-export const getExecTransactionSigners = async (
+// Decoder function type for different transaction types
+type TransactionDecoder = (
+  transaction: Transaction,
+  nonce: number,
+  provider: providers.JsonRpcProvider,
+  iface: utils.Interface
+) => Promise<string[]>
+
+// Decoder for execTransaction calls
+const decodeExecTransaction: TransactionDecoder = async (
+  transaction,
+  nonce,
+  provider,
+  iface
+) => {
+  const decodedData = iface.decodeFunctionData('execTransaction', transaction.data)
+  const signatures = decodedData.signatures
+    .slice(2)
+    .match(/.{1,130}/g)
+    .map((sig: string) => `0x${sig}`)
+
+  const contract = new Contract(transaction.to!, iface, provider)
+
+  const signers = await Promise.all(
+    signatures.map(async (sig: string) => {
+      const [dataHash] = await contract.functions.getTransactionHash(
+        decodedData.to,
+        decodedData.value,
+        decodedData.data,
+        decodedData.operation,
+        decodedData.safeTxGas,
+        decodedData.baseGas,
+        decodedData.gasPrice,
+        decodedData.gasToken,
+        decodedData.refundReceiver,
+        nonce
+      )
+
+      return recoverAddress(dataHash, sig)
+    })
+  )
+
+  return signers
+}
+
+const decodeMultiSend: TransactionDecoder = async (transaction, nonce, provider, iface) => {
+  const decodedData = iface.decodeFunctionData('multiSend', transaction.data)
+  const innerTransactions = parseMultiSendTransactions(decodedData.transactions)
+  const signers = await Promise.all(
+    innerTransactions.map(async (tx: Transaction) =>  getTransactionSigners(tx, nonce, provider))
+  )
+
+  return signers.flat()
+}
+const parseMultiSendTransactions = (transactions: string): Transaction[] => {
+  // Each inner transaction is 32 bytes (to) + 32 bytes (value) + 32 bytes (data length) + N bytes (data)
+  // But Gnosis MultiSend uses a custom format:
+  // [operation:1][to:20][value:32][dataLen:32][data:dataLen]
+  // See: https://github.com/safe-global/safe-contracts/blob/main/contracts/libraries/MultiSend.sol
+
+  const txs: Transaction[] = []
+  let offset = 0 // skip '0x'
+
+  const hex = transactions.startsWith('0x') ? transactions.slice(2) : transactions
+
+  while (offset < hex.length) {
+    // operation (1 byte)
+    const operation = parseInt(hex.slice(offset, offset + 2), 16)
+    offset += 2
+
+    // to (20 bytes)
+    const to = '0x' + hex.slice(offset, offset + 40)
+    offset += 40
+
+    // value (32 bytes)
+    const value = utils.hexZeroPad('0x' + hex.slice(offset, offset + 64), 32)
+    offset += 64
+
+    // data length (32 bytes)
+    const dataLen = parseInt(hex.slice(offset, offset + 64), 16)
+    offset += 64
+
+    // data (dataLen bytes)
+    const data = '0x' + hex.slice(offset, offset + dataLen * 2)
+    offset += dataLen * 2
+    
+    txs.push({
+      to,
+      value: BigNumber.from(value),
+      data,
+      operation,
+    } as unknown as Transaction)
+
+  }
+  return txs
+}
+
+
+// Registry of transaction decoders
+// To add support for new transaction types:
+// 1. Create a decoder function following the TransactionDecoder type
+// 2. Add it to this registry with the function name as the key
+const transactionDecoders: Record<string, TransactionDecoder> = {
+  execTransaction: decodeExecTransaction,
+  multiSend: decodeMultiSend,
+}
+
+// Get the function selector from transaction data
+const getFunctionSelector = (data: string): string => {
+  return data.slice(0, 10) // First 4 bytes (8 hex chars + 0x)
+}
+
+// Get function name from selector using the interface
+const getFunctionName = (selector: string, iface: utils.Interface): string | null => {
+  try {
+    const fragment = iface.getFunction(selector)
+    return fragment.name
+  } catch {
+    return null
+  }
+}
+
+export const getTransactionSigners = async (
   transaction: Transaction,
   nonce: number,
   provider: providers.JsonRpcProvider
-) => {
+): Promise<string[]> => {
   try {
     const iface = new utils.Interface(GnosisSafe)
-    const decodedData = iface.decodeFunctionData('execTransaction', transaction.data)
-    const signatures = decodedData.signatures
-      .slice(2)
-      .match(/.{1,130}/g)
-      .map((sig: string) => `0x${sig}`)
+    const selector = getFunctionSelector(transaction.data)
+    const functionName = getFunctionName(selector, iface)
 
-    const contract = new Contract(transaction.to!, iface, provider)
+    if (!functionName || !transactionDecoders[functionName]) {
+      console.warn(`No decoder available for function: ${functionName || 'unknown'}`)
+      return []
+    }
 
-    const signers = await Promise.all(
-      signatures.map(async (sig: string) => {
-        const [dataHash] = await contract.functions.getTransactionHash(
-          decodedData.to,
-          decodedData.value,
-          decodedData.data,
-          decodedData.operation,
-          decodedData.safeTxGas,
-          decodedData.baseGas,
-          decodedData.gasPrice,
-          decodedData.gasToken,
-          decodedData.refundReceiver,
-          nonce
-        )
-
-        return recoverAddress(dataHash, sig)
-      })
-    )
-
-    return signers
-  } catch {
-    // This means it's not an execTransaction (TODO: Decode data from functions other than execTransaction)
+    const decoder = transactionDecoders[functionName]
+    return await decoder(transaction, nonce, provider, iface)
+  } catch (error) {
+    console.warn('Failed to decode transaction:', error)
     return []
   }
 }
 
-export const getExecTransactionData = async (transaction: any, nonce: number, provider: providers.JsonRpcProvider) => {
+export const getTransactionData = async (
+  transaction: any, 
+  nonce: number, 
+  provider: providers.JsonRpcProvider,
+) => {
   const executor = utils.getAddress(transaction.from)
-  const signers = await getExecTransactionSigners(transaction, nonce, provider)
+  const signers = await getTransactionSigners(transaction, nonce, provider)
   return { executor, signers, transaction }
 }
 
@@ -94,7 +200,7 @@ export const loadTransactions = async (address: string, provider?: providers.Jso
   const transactions = await pRetry(() => getAddressTransactions(address, provider), { retries: 5 })
 
   const parsedTransactions = await Promise.all(
-    transactions.map(async (tx: any, nonce: number) => getExecTransactionData(tx, nonce, provider))
+    transactions.map(async (tx: any, nonce: number) => getTransactionData(tx, nonce, provider))
   )
 
   return parsedTransactions
