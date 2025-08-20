@@ -33,12 +33,7 @@ type TransactionDecoder = (
 ) => Promise<string[]>
 
 // Decoder for execTransaction calls
-const decodeExecTransaction: TransactionDecoder = async (
-  transaction,
-  nonce,
-  provider,
-  iface
-) => {
+const decodeExecTransaction: TransactionDecoder = async (transaction, nonce, provider, iface) => {
   const decodedData = iface.decodeFunctionData('execTransaction', transaction.data)
   const signatures = decodedData.signatures
     .slice(2)
@@ -73,7 +68,7 @@ const decodeMultiSend: TransactionDecoder = async (transaction, nonce, provider,
   const decodedData = iface.decodeFunctionData('multiSend', transaction.data)
   const innerTransactions = parseMultiSendTransactions(decodedData.transactions)
   const signers = await Promise.all(
-    innerTransactions.map(async (tx: Transaction) =>  getTransactionSigners(tx, nonce, provider))
+    innerTransactions.map(async (tx: Transaction) => getTransactionSigners(tx, nonce, provider))
   )
 
   return signers.flat()
@@ -109,18 +104,16 @@ const parseMultiSendTransactions = (transactions: string): Transaction[] => {
     // data (dataLen bytes)
     const data = '0x' + hex.slice(offset, offset + dataLen * 2)
     offset += dataLen * 2
-    
+
     txs.push({
       to,
       value: BigNumber.from(value),
       data,
       operation,
     } as unknown as Transaction)
-
   }
   return txs
 }
-
 
 // Registry of transaction decoders
 // To add support for new transaction types:
@@ -169,11 +162,7 @@ export const getTransactionSigners = async (
   }
 }
 
-export const getTransactionData = async (
-  transaction: any, 
-  nonce: number, 
-  provider: providers.JsonRpcProvider,
-) => {
+export const getTransactionData = async (transaction: any, nonce: number, provider: providers.JsonRpcProvider) => {
   const executor = utils.getAddress(transaction.from)
   const signers = await getTransactionSigners(transaction, nonce, provider)
   return { executor, signers, transaction }
